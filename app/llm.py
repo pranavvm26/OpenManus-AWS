@@ -1,3 +1,4 @@
+import json
 from typing import Dict, List, Optional, Union
 
 from openai import (
@@ -8,10 +9,12 @@ from openai import (
     OpenAIError,
     RateLimitError,
 )
+from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageToolCall  # Moved to top
 from tenacity import retry, stop_after_attempt, wait_random_exponential
+from litellm import acompletion  # Use async completion for litellm
 
 from app.config import LLMSettings, config
-from app.logger import logger  # Assuming a logger is set up in your app
+from app.logger import logger
 from app.schema import (
     ROLE_VALUES,
     TOOL_CHOICE_TYPE,
@@ -20,9 +23,7 @@ from app.schema import (
     ToolChoice,
 )
 
-
 REASONING_MODELS = ["o1", "o3-mini"]
-
 
 class LLM:
     _instances: Dict[str, "LLM"] = {}
@@ -49,53 +50,43 @@ class LLM:
             self.api_key = llm_config.api_key
             self.api_version = llm_config.api_version
             self.base_url = llm_config.base_url
+
+            # Initialize client based on api_type
             if self.api_type == "azure":
                 self.client = AsyncAzureOpenAI(
                     base_url=self.base_url,
                     api_key=self.api_key,
                     api_version=self.api_version,
                 )
-            else:
+                self.use_litellm = False
+            elif self.api_type == "openai":
                 self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+                self.use_litellm = False
+            elif self.api_type == "litellm":
+                self.use_litellm = True
+                # litellm handles Bedrock authentication via AWS credentials (e.g., boto3)
+                # No explicit client initialization needed here
+            else:
+                raise ValueError(f"Unsupported api_type: {self.api_type}")
 
     @staticmethod
     def format_messages(messages: List[Union[dict, Message]]) -> List[dict]:
         """
         Format messages for LLM by converting them to OpenAI message format.
-
-        Args:
-            messages: List of messages that can be either dict or Message objects
-
-        Returns:
-            List[dict]: List of formatted messages in OpenAI format
-
-        Raises:
-            ValueError: If messages are invalid or missing required fields
-            TypeError: If unsupported message types are provided
-
-        Examples:
-            >>> msgs = [
-            ...     Message.system_message("You are a helpful assistant"),
-            ...     {"role": "user", "content": "Hello"},
-            ...     Message.user_message("How are you?")
-            ... ]
-            >>> formatted = LLM.format_messages(msgs)
+        (Unchanged from original)
         """
         formatted_messages = []
 
         for message in messages:
             if isinstance(message, dict):
-                # If message is already a dict, ensure it has required fields
                 if "role" not in message:
                     raise ValueError("Message dict must contain 'role' field")
                 formatted_messages.append(message)
             elif isinstance(message, Message):
-                # If message is a Message object, convert it to dict
                 formatted_messages.append(message.to_dict())
             else:
                 raise TypeError(f"Unsupported message type: {type(message)}")
 
-        # Validate all messages have required fields
         for msg in formatted_messages:
             if msg["role"] not in ROLE_VALUES:
                 raise ValueError(f"Invalid role: {msg['role']}")
@@ -119,20 +110,6 @@ class LLM:
     ) -> str:
         """
         Send a prompt to the LLM and get the response.
-
-        Args:
-            messages: List of conversation messages
-            system_msgs: Optional system messages to prepend
-            stream (bool): Whether to stream the response
-            temperature (float): Sampling temperature for the response
-
-        Returns:
-            str: The generated response
-
-        Raises:
-            ValueError: If messages are invalid or response is empty
-            OpenAIError: If API call fails after retries
-            Exception: For unexpected errors
         """
         try:
             # Format system and user messages
@@ -153,31 +130,51 @@ class LLM:
                 params["max_tokens"] = self.max_tokens
                 params["temperature"] = temperature or self.temperature
 
-            if not stream:
-                # Non-streaming request
-                params["stream"] = False
+            if self.use_litellm:
+                # Handle Bedrock via litellm
+                params["stream"] = stream
+                if not stream:
+                    response = await acompletion(**params)
+                    if not response.choices or not response.choices[0].message.content:
+                        raise ValueError("Empty or invalid response from LLM")
+                    return response.choices[0].message.content
 
+                # Streaming with litellm
+                response = await acompletion(**params)
+                collected_messages = []
+                async for chunk in response:
+                    chunk_message = chunk.choices[0].delta.content or ""
+                    collected_messages.append(chunk_message)
+                    print(chunk_message, end="", flush=True)
+
+                print()  # Newline after streaming
+                full_response = "".join(collected_messages).strip()
+                if not full_response:
+                    raise ValueError("Empty response from streaming LLM")
+                return full_response
+
+            else:
+                # Handle OpenAI/Azure
+                if not stream:
+                    params["stream"] = False
+                    response = await self.client.chat.completions.create(**params)
+                    if not response.choices or not response.choices[0].message.content:
+                        raise ValueError("Empty or invalid response from LLM")
+                    return response.choices[0].message.content
+
+                params["stream"] = True
                 response = await self.client.chat.completions.create(**params)
+                collected_messages = []
+                async for chunk in response:
+                    chunk_message = chunk.choices[0].delta.content or ""
+                    collected_messages.append(chunk_message)
+                    print(chunk_message, end="", flush=True)
 
-                if not response.choices or not response.choices[0].message.content:
-                    raise ValueError("Empty or invalid response from LLM")
-                return response.choices[0].message.content
-
-            # Streaming request
-            params["stream"] = True
-            response = await self.client.chat.completions.create(**params)
-
-            collected_messages = []
-            async for chunk in response:
-                chunk_message = chunk.choices[0].delta.content or ""
-                collected_messages.append(chunk_message)
-                print(chunk_message, end="", flush=True)
-
-            print()  # Newline after streaming
-            full_response = "".join(collected_messages).strip()
-            if not full_response:
-                raise ValueError("Empty response from streaming LLM")
-            return full_response
+                print()  # Newline after streaming
+                full_response = "".join(collected_messages).strip()
+                if not full_response:
+                    raise ValueError("Empty response from streaming LLM")
+                return full_response
 
         except ValueError as ve:
             logger.error(f"Validation error: {ve}")
@@ -205,26 +202,9 @@ class LLM:
     ):
         """
         Ask LLM using functions/tools and return the response.
-
-        Args:
-            messages: List of conversation messages
-            system_msgs: Optional system messages to prepend
-            timeout: Request timeout in seconds
-            tools: List of tools to use
-            tool_choice: Tool choice strategy
-            temperature: Sampling temperature for the response
-            **kwargs: Additional completion arguments
-
-        Returns:
-            ChatCompletionMessage: The model's response
-
-        Raises:
-            ValueError: If tools, tool_choice, or messages are invalid
-            OpenAIError: If API call fails after retries
-            Exception: For unexpected errors
         """
         try:
-            # Validate tool_choice
+            # Validate tool_choice (only relevant for OpenAI)
             if tool_choice not in TOOL_CHOICE_VALUES:
                 raise ValueError(f"Invalid tool_choice: {tool_choice}")
 
@@ -245,8 +225,6 @@ class LLM:
             params = {
                 "model": self.model,
                 "messages": messages,
-                "tools": tools,
-                "tool_choice": tool_choice,
                 "timeout": timeout,
                 **kwargs,
             }
@@ -257,14 +235,53 @@ class LLM:
                 params["max_tokens"] = self.max_tokens
                 params["temperature"] = temperature or self.temperature
 
-            response = await self.client.chat.completions.create(**params)
+            # Add tools to params for OpenAI, but rely on system prompt for Bedrock
+            if not self.use_litellm:
+                params["tools"] = tools
+                params["tool_choice"] = tool_choice
+            else:
+                params["drop_params"] = True  # Drop unsupported params for Bedrock
 
-            # Check if response is valid
-            if not response.choices or not response.choices[0].message:
-                print(response)
-                raise ValueError("Invalid or empty response from LLM")
+            # Call the LLM
+            if self.use_litellm:
+                response = await acompletion(**params)
+                content = response.choices[0].message.content
+                logger.debug(f"Bedrock response content: {content}")
 
-            return response.choices[0].message
+                # Parse the response for tool invocation
+                try:
+                    # Attempt to parse as JSON for tool invocation
+                    tool_data = json.loads(content)
+                    if isinstance(tool_data, dict) and "tool" in tool_data:
+                        logger.info(f"Tool invocation detected: {tool_data}")
+                        return ChatCompletionMessage(
+                            role="assistant",
+                            content=None,
+                            tool_calls=[
+                                ChatCompletionMessageToolCall(
+                                    id="call_1",  # Dummy ID
+                                    type="function",
+                                    function={
+                                        "name": tool_data["tool"],
+                                        "arguments": json.dumps({k: v for k, v in tool_data.items() if k != "tool"})
+                                    }
+                                )
+                            ]
+                        )
+                except json.JSONDecodeError:
+                    # If not JSON, treat as plain text response
+                    pass
+
+                # Return plain text response if no tool invocation
+                return ChatCompletionMessage(role="assistant", content=content, tool_calls=None)
+
+            else:
+                # OpenAI/Azure path
+                response = await self.client.chat.completions.create(**params)
+                if not response.choices or not response.choices[0].message:
+                    logger.error(f"Invalid response from LLM: {response}")
+                    raise ValueError("Invalid or empty response from LLM")
+                return response.choices[0].message
 
         except ValueError as ve:
             logger.error(f"Validation error in ask_tool: {ve}")
